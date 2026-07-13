@@ -17,7 +17,7 @@ title, the project it belongs to, and its age. Hit Enter to resume it with
 ## Install (shell alias)
 
 ```bash
-git clone <this repo> ~/git/clres
+git clone https://github.com/BelCorentin/clres ~/git/clres
 ~/git/clres/install.sh   # adds `alias clres=...` to ~/.zshrc
 ```
 
