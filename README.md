@@ -7,10 +7,10 @@ title, the project it belongs to, and its age. Hit Enter to resume it with
 `claude --resume` from its original working directory.
 
 ```
- clres · 36/36 conversations          ↑↓ move · Enter resume · / filter · q quit
- 🖥️ I'd like to make a little interface to browse...   claude            2m
- 🐛 debugging AudioVolume decoding anomaly...          b1_mindsentences  3d
- 📚 sphinx docs landing page refinement...             neuralhub-repo    5d
+ clres · 19/36 conversations   ↑↓ move · Enter resume · t title · a all · q quit
+ 🖥️ ✨ Terminal browser for Claude Code conversations   my-tools          2m
+ 🐛 ✨ Fix flaky integration test on CI                 backend           3d
+ 📚 ✨ Sphinx docs landing page refresh                 docs-site         5d
  ...
 ```
 
