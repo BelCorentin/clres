@@ -1,0 +1,13 @@
+{
+  "name": "clres",
+  "owner": {
+    "name": "Corentin Bel"
+  },
+  "plugins": [
+    {
+      "name": "clres",
+      "source": "./",
+      "description": "Browse and resume Claude Code conversations from a small terminal picker."
+    }
+  ]
+}
