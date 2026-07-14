@@ -1,7 +1,7 @@
 {
   "name": "clres",
   "description": "Browse and resume Claude Code conversations from a small terminal picker (emoji + title + project + age).",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Corentin Bel"
   }

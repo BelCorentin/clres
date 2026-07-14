@@ -10,11 +10,12 @@ Tiny conversations (title shorter than CLRES_MIN_TITLE chars, e.g. bare
 haiku-generated title, cached in ~/.cache/clres/titles.json.
 
 Usage:
-  clres            interactive picker
-  clres --all      include tiny conversations
-  clres --index    generate haiku titles for all large untitled convos
-  clres --list     plain table (no TTY needed)
-  clres --json     machine-readable dump
+  clres              interactive picker
+  clres --all        include tiny + headless conversations
+  clres --index      generate haiku titles for all untitled real convos
+  clres --summarize  generate haiku summaries for all real convos
+  clres --list       plain table (no TTY needed)
+  clres --json       machine-readable dump
 """
 
 import curses
@@ -33,7 +34,7 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 CACHE_FILE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "clres" / "titles.json"
 
 MIN_TITLE_CHARS = int(os.environ.get("CLRES_MIN_TITLE", "20"))  # hide shorter
-MIN_ENTRIES = int(os.environ.get("CLRES_MIN_ENTRIES", "50"))  # --index eligibility
+MIN_ENTRIES = int(os.environ.get("CLRES_MIN_ENTRIES", "15"))  # --index eligibility
 TITLE_MODEL = os.environ.get("CLRES_MODEL", "haiku")
 # The titler's own headless `claude -p` calls get logged as sessions too;
 # corral them into one throwaway project dir that clres skips and deletes.
@@ -73,11 +74,15 @@ class Session:
     n_lines: int
     size: int
     generated: bool
+    headless: bool
+    summary: str
     path: str
 
     @property
     def small(self) -> bool:
-        return not self.generated and len(self.title) < MIN_TITLE_CHARS
+        """Hidden by default: headless agent sessions (statusline bots,
+        sdk calls) and conversations too tiny to have a real title."""
+        return self.headless or (not self.generated and len(self.title) < MIN_TITLE_CHARS)
 
 
 def load_cache() -> dict:
@@ -131,7 +136,7 @@ def scan_sessions(cache: dict) -> list[Session]:
     for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
         if jsonl.parent.name == TITLER_SLUG:
             continue
-        title, cwd = None, None
+        title, cwd, entrypoint = None, None, None
         n_lines = 0
         try:
             with open(jsonl, errors="replace") as fh:
@@ -147,6 +152,8 @@ def scan_sessions(cache: dict) -> list[Session]:
                         cwd = entry["cwd"]
                     if title is None:
                         title = _user_text(entry)
+                        if title is not None:
+                            entrypoint = entry.get("entrypoint", "cli")
             stat = jsonl.stat()
         except OSError:
             continue
@@ -168,6 +175,8 @@ def scan_sessions(cache: dict) -> list[Session]:
             n_lines=n_lines,
             size=stat.st_size,
             generated=generated,
+            headless=entrypoint not in ("cli", "claude-desktop"),
+            summary=cache.get(sid, {}).get("summary", ""),
             path=str(jsonl),
         ))
     sessions.sort(key=lambda s: s.mtime, reverse=True)
@@ -202,16 +211,7 @@ def _endpoints(path: str) -> tuple[str, str]:
     return first[:1500], re.sub(r"\s+", " ", last).strip()[:1500]
 
 
-def generate_title(session: Session) -> str | None:
-    first, last = _endpoints(session.path)
-    if not first and not last:
-        return None
-    prompt = (
-        "Write a short descriptive title (max 8 words, no quotes, no trailing "
-        "period) for this coding-assistant conversation, based on its first "
-        "user message and last assistant message. Output the title only.\n\n"
-        f"FIRST USER MESSAGE:\n{first}\n\nLAST ASSISTANT MESSAGE:\n{last}"
-    )
+def _ask_haiku(prompt: str) -> str | None:
     try:
         TITLER_CWD.mkdir(exist_ok=True)
         out = subprocess.run(
@@ -222,29 +222,80 @@ def generate_title(session: Session) -> str | None:
         return None
     finally:
         shutil.rmtree(PROJECTS_DIR / TITLER_SLUG, ignore_errors=True)
-    title = out.stdout.strip().splitlines()[0].strip(' "\'') if out.stdout.strip() else ""
-    return title[:100] or None
+    return out.stdout.strip() or None
+
+
+def generate_title(session: Session) -> str | None:
+    first, last = _endpoints(session.path)
+    if not first and not last:
+        return None
+    out = _ask_haiku(
+        "Write a short descriptive title (max 8 words, no quotes, no trailing "
+        "period) for this coding-assistant conversation, based on its first "
+        "user message and last assistant message. Output the title only.\n\n"
+        f"FIRST USER MESSAGE:\n{first}\n\nLAST ASSISTANT MESSAGE:\n{last}"
+    )
+    return out.splitlines()[0].strip(' "\'')[:100] if out else None
+
+
+def generate_summary(session: Session) -> str | None:
+    first, last = _endpoints(session.path)
+    if not first and not last:
+        return None
+    out = _ask_haiku(
+        "Summarize this coding-assistant conversation in 2-3 plain sentences: "
+        "what the user wanted and where it ended up. No preamble.\n\n"
+        f"FIRST USER MESSAGE:\n{first}\n\nLAST ASSISTANT MESSAGE:\n{last}"
+    )
+    return re.sub(r"\s+", " ", out).strip()[:600] if out else None
+
+
+def _cache_set(cache: dict, sid: str, **fields) -> None:
+    entry = cache.setdefault(sid, {})
+    entry.update(fields, generated_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    save_cache(cache)
 
 
 def apply_title(session: Session, title: str, cache: dict) -> None:
     session.title = title
     session.generated = True
     session.emoji = _pick_emoji(title, session.session_id)
-    cache[session.session_id] = {"title": title, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-    save_cache(cache)
+    _cache_set(cache, session.session_id, title=title)
+
+
+def apply_summary(session: Session, summary: str, cache: dict) -> None:
+    session.summary = summary
+    _cache_set(cache, session.session_id, summary=summary)
 
 
 def index_titles(sessions: list[Session], cache: dict) -> None:
-    todo = [s for s in sessions if not s.generated and s.n_lines >= MIN_ENTRIES]
+    todo = [s for s in sessions
+            if not s.generated and not s.headless and s.n_lines >= MIN_ENTRIES]
     if not todo:
-        print("All large conversations already titled.")
+        print("All conversations already titled.")
         return
-    print(f"Titling {len(todo)} large conversations with {TITLE_MODEL}...")
+    print(f"Titling {len(todo)} conversations with {TITLE_MODEL}...")
     for i, s in enumerate(todo, 1):
         title = generate_title(s)
         if title:
             apply_title(s, title, cache)
             print(f"  [{i}/{len(todo)}] {s.emoji} {title}")
+        else:
+            print(f"  [{i}/{len(todo)}] failed: {s.session_id[:8]}")
+
+
+def index_summaries(sessions: list[Session], cache: dict) -> None:
+    todo = [s for s in sessions
+            if not s.summary and not s.headless and s.n_lines >= MIN_ENTRIES]
+    if not todo:
+        print("All conversations already summarized.")
+        return
+    print(f"Summarizing {len(todo)} conversations with {TITLE_MODEL}...")
+    for i, s in enumerate(todo, 1):
+        summary = generate_summary(s)
+        if summary:
+            apply_summary(s, summary, cache)
+            print(f"  [{i}/{len(todo)}] {s.emoji} {s.title[:40]}: {summary[:70]}")
         else:
             print(f"  [{i}/{len(todo)}] failed: {s.session_id[:8]}")
 
@@ -267,6 +318,24 @@ def resume(session: Session) -> None:
 
 # ---------------------------------------------------------------- TUI
 
+def _popup(stdscr, title: str, text: str) -> None:
+    h, w = stdscr.getmaxyx()
+    import textwrap
+    box_w = min(w - 4, 90)
+    lines = textwrap.wrap(text, box_w - 4) or ["(empty)"]
+    box_h = min(len(lines) + 4, h - 2)
+    y0, x0 = (h - box_h) // 2, (w - box_w) // 2
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.erase()
+    win.box()
+    win.addnstr(0, 2, f" {title} ", box_w - 4, curses.A_BOLD)
+    for i, line in enumerate(lines[:box_h - 4]):
+        win.addnstr(i + 2, 2, line, box_w - 4)
+    win.addnstr(box_h - 1, 2, " any key to close ", box_w - 4, curses.A_DIM)
+    win.refresh()
+    win.getch()
+
+
 def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
     curses.curs_set(0)
     curses.use_default_colors()
@@ -276,6 +345,7 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
     curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # header/filter
 
     selected, offset, query = 0, 0, ""
+    search_mode = False
     flash = ""
 
     def filtered():
@@ -284,7 +354,8 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             rows = sessions
         if query:
             q = query.lower()
-            rows = [s for s in rows if q in s.title.lower() or q in s.project.lower()]
+            rows = [s for s in rows if q in s.title.lower() or q in s.project.lower()
+                    or q in s.summary.lower()]
         return rows
 
     while True:
@@ -300,7 +371,8 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
 
         stdscr.erase()
         header = f" clres · {len(rows)}/{len(sessions)}{' (all)' if show_all else ''} "
-        hint = " ↑↓ move · Enter resume · t title · a all · / filter · q quit "
+        hint = (" type to search · Enter done · Esc cancel " if search_mode else
+                " ↑↓ move · Enter resume · / search · s summary · t title · a all · q quit ")
         stdscr.addnstr(0, 0, header, w - 1, curses.color_pair(4) | curses.A_BOLD)
         stdscr.addnstr(0, max(0, w - len(hint) - 1), hint, w - 1, curses.A_DIM)
 
@@ -324,21 +396,49 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             status = f" {flash} "
         elif rows and 0 <= selected < len(rows):
             s = rows[selected]
-            gen = " · ✨titled" if s.generated else ""
-            status = f" {s.session_id[:8]} · {s.cwd} · {s.n_lines} entries · {s.size // 1024}K{gen} "
+            if s.summary:
+                status = f" {s.summary} "
+            else:
+                gen = " · ✨titled" if s.generated else ""
+                status = f" {s.session_id[:8]} · {s.cwd} · {s.n_lines} entries · {s.size // 1024}K{gen} "
         else:
             status = " no match "
         stdscr.addnstr(h - 2, 0, status[:w - 1], w - 1, curses.A_DIM)
-        prompt = f" /{query}" if query else ""
-        stdscr.addnstr(h - 1, 0, prompt[:w - 1], w - 1, curses.color_pair(4))
+        if search_mode or query:
+            cursor = "█" if search_mode else ""
+            stdscr.addnstr(h - 1, 0, f" /{query}{cursor}"[:w - 1], w - 1, curses.color_pair(4))
         stdscr.refresh()
         flash = ""
 
+        def busy(msg):
+            stdscr.addnstr(h - 2, 0, f" ✨ {msg}... "[:w - 1], w - 1, curses.color_pair(4))
+            stdscr.refresh()
+
         key = stdscr.getch()
-        if key in (ord("q"), 27) and not query:
+        if search_mode:
+            if key in (curses.KEY_ENTER, 10, 13):
+                search_mode = False
+            elif key == 27:  # Esc: cancel search
+                search_mode, query = False, ""
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                query = query[:-1]
+            elif key in (curses.KEY_DOWN,):
+                selected += 1
+            elif key in (curses.KEY_UP,):
+                selected -= 1
+            elif 32 <= key < 127:
+                query += chr(key)
+                selected = 0
+            continue
+        if key == ord("q"):
             return None
         elif key == 27:
-            query = ""
+            if query:
+                query = ""
+            else:
+                return None
+        elif key == ord("/"):
+            search_mode = True
         elif key in (curses.KEY_DOWN, ord("j")):
             selected += 1
         elif key in (curses.KEY_UP, ord("k")):
@@ -354,28 +454,31 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
         elif key in (curses.KEY_ENTER, 10, 13):
             if rows:
                 return rows[selected]
-        elif key == ord("a") and not query:
+        elif key == ord("a"):
             show_all = not show_all
             selected = 0
-        elif key == ord("t") and not query:
+        elif key == ord("t"):
             if rows:
                 s = rows[selected]
-                stdscr.addnstr(h - 2, 0, f" ✨ titling {s.session_id[:8]} with {TITLE_MODEL}... "[:w - 1],
-                               w - 1, curses.color_pair(4))
-                stdscr.refresh()
+                busy(f"titling {s.session_id[:8]} with {TITLE_MODEL}")
                 title = generate_title(s)
                 if title:
                     apply_title(s, title, cache)
                     flash = f"✨ {title}"
                 else:
                     flash = "title generation failed"
-        elif key == ord("/"):
-            query = ""
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            query = query[:-1]
-        elif 32 <= key < 127:
-            query += chr(key)
-            selected = 0
+        elif key == ord("s"):
+            if rows:
+                s = rows[selected]
+                if not s.summary:
+                    busy(f"summarizing {s.session_id[:8]} with {TITLE_MODEL}")
+                    summary = generate_summary(s)
+                    if summary:
+                        apply_summary(s, summary, cache)
+                    else:
+                        flash = "summary generation failed"
+                if s.summary:
+                    _popup(stdscr, f"{s.emoji} {s.title[:60]}", s.summary)
 
 
 def print_list(sessions: list[Session], show_all: bool) -> None:
@@ -395,6 +498,9 @@ def main() -> None:
     show_all = "--all" in sys.argv
     if "--index" in sys.argv:
         index_titles(sessions, cache)
+        return
+    if "--summarize" in sys.argv:
+        index_summaries(sessions, cache)
         return
     if "--json" in sys.argv:
         print(json.dumps([s.__dict__ for s in sessions], indent=2))
