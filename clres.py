@@ -197,7 +197,7 @@ def _endpoints(path: str) -> tuple[str, str]:
                         first = t
                 except json.JSONDecodeError:
                     pass
-            if '"type":"assistant"' in line[:400]:
+            if '"type":"assistant"' in line and '"isSidechain":true' not in line:
                 last_raw = line
     last = ""
     if last_raw:
