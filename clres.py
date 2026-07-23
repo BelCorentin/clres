@@ -31,6 +31,7 @@ from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+GOALS_DIR = CLAUDE_DIR / "goals"   # session-state.sh registry (<sid>.json)
 CACHE_FILE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "clres" / "titles.json"
 
 MIN_TITLE_CHARS = int(os.environ.get("CLRES_MIN_TITLE", "20"))  # hide shorter
@@ -123,6 +124,16 @@ def _user_text(entry: dict) -> str | None:
     return re.sub(r"\s+", " ", text)
 
 
+def _registry_state(sid: str) -> dict:
+    """Live session state written by the session-state.sh hook, or {}.
+    Shared source with the statusline, ntfy pushes, and ccview."""
+    try:
+        d = json.loads((GOALS_DIR / f"{sid}.json").read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _pick_emoji(title: str, session_id: str) -> str:
     low = title.lower()
     for pattern, emoji in EMOJI_KEYWORDS:
@@ -161,14 +172,26 @@ def scan_sessions(cache: dict) -> list[Session]:
             continue  # no real user prompt -> not worth listing
         sid = jsonl.stem
         generated = False
+        emoji = None
+        summary = cache.get(sid, {}).get("summary", "")
         cached = cache.get(sid, {}).get("title")
         if cached:
             title, generated = cached, True
+        else:
+            # Prefer the live session-state registry goal over the raw first
+            # prompt — it's summarized at turn end and shared with the
+            # statusline/ntfy/ccview, so no extra Haiku call here.
+            reg = _registry_state(sid)
+            if reg.get("goal"):
+                title, generated = reg["goal"], True
+                emoji = reg.get("emoji") or None
+                if not summary and reg.get("detail"):
+                    summary = reg["detail"]
         cwd = cwd or str(Path.home())
         sessions.append(Session(
             session_id=sid,
             title=title,
-            emoji=_pick_emoji(title, sid),
+            emoji=emoji or _pick_emoji(title, sid),
             cwd=cwd,
             project=Path(cwd).name or cwd,
             mtime=stat.st_mtime,
@@ -176,7 +199,7 @@ def scan_sessions(cache: dict) -> list[Session]:
             size=stat.st_size,
             generated=generated,
             headless=entrypoint not in ("cli", "claude-desktop"),
-            summary=cache.get(sid, {}).get("summary", ""),
+            summary=summary,
             path=str(jsonl),
         ))
     sessions.sort(key=lambda s: s.mtime, reverse=True)
