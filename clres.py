@@ -32,6 +32,8 @@ from pathlib import Path
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 GOALS_DIR = CLAUDE_DIR / "goals"   # session-state.sh registry (<sid>.json)
+COMEBACK_DIR = CLAUDE_DIR / "comeback"   # marker files: <sid> present == "might come back"
+RECENT_S = 24 * 3600               # sessions newer than this stay in the focused view
 CACHE_FILE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "clres" / "titles.json"
 
 MIN_TITLE_CHARS = int(os.environ.get("CLRES_MIN_TITLE", "20"))  # hide shorter
@@ -79,6 +81,7 @@ class Session:
     summary: str
     path: str
     branch: str = ""      # git branch (+ ' @worktree' if linked)
+    comeback: bool = False   # flagged "might come back" (~/.claude/comeback/<sid>)
 
     @property
     def small(self) -> bool:
@@ -123,6 +126,21 @@ def _user_text(entry: dict) -> str | None:
     if text.startswith("Caveat: the messages below"):
         return None
     return re.sub(r"\s+", " ", text)
+
+
+def is_comeback(sid: str) -> bool:
+    return (COMEBACK_DIR / sid).exists()
+
+
+def toggle_comeback(sid: str) -> bool:
+    """Flip the 'might come back' flag for *sid*. Returns the new state."""
+    COMEBACK_DIR.mkdir(parents=True, exist_ok=True)
+    marker = COMEBACK_DIR / sid
+    if marker.exists():
+        marker.unlink()
+        return False
+    marker.touch()
+    return True
 
 
 _GIT_CACHE: dict[str, str] = {}
@@ -232,6 +250,7 @@ def scan_sessions(cache: dict) -> list[Session]:
             summary=summary,
             path=str(jsonl),
             branch=_git_brief(cwd),
+            comeback=is_comeback(sid),
         ))
     sessions.sort(key=lambda s: s.mtime, reverse=True)
     return sessions
@@ -400,12 +419,18 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
 
     selected, offset, query = 0, 0, ""
     search_mode = False
+    focus = True                 # default view: flagged "might come back" + recent
     flash = ""
 
     def filtered():
         rows = sessions if show_all else [s for s in sessions if not s.small]
         if not rows:
             rows = sessions
+        if focus:
+            now = time.time()
+            foc = [s for s in rows if s.comeback or (now - s.mtime) < RECENT_S]
+            if foc:
+                rows = foc
         if query:
             q = query.lower()
             rows = [s for s in rows if q in s.title.lower() or q in s.project.lower()
@@ -424,9 +449,10 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
         offset = max(0, offset)
 
         stdscr.erase()
-        header = f" clres · {len(rows)}/{len(sessions)}{' (all)' if show_all else ''} "
+        scope = " (all)" if show_all else (" 🔖focus" if focus else " (recent+old)")
+        header = f" clres · {len(rows)}/{len(sessions)}{scope} "
         hint = (" type to search · Enter done · Esc cancel " if search_mode else
-                " ↑↓ move · Enter resume · / search · s summary · t title · a all · q quit ")
+                " ↑↓ · ⏎ resume · m 🔖 · c focus · / search · s summary · t title · a all · q ")
         stdscr.addnstr(0, 0, header, w - 1, curses.color_pair(4) | curses.A_BOLD)
         stdscr.addnstr(0, max(0, w - len(hint) - 1), hint, w - 1, curses.A_DIM)
 
@@ -435,14 +461,15 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             is_sel = (offset + i) == selected
             age = rel_age(s.mtime).rjust(4)
             proj = s.project[:16].ljust(16)
+            flag = "🔖" if s.comeback else "  "
             title = s.title
             if is_sel:
                 stdscr.addnstr(y, 0, " " * (w - 1), w - 1, curses.color_pair(3))
-                stdscr.addnstr(y, 1, f"{s.emoji} {title}", w - 26, curses.color_pair(3) | curses.A_BOLD)
+                stdscr.addnstr(y, 1, f"{flag}{s.emoji} {title}", w - 26, curses.color_pair(3) | curses.A_BOLD)
                 stdscr.addnstr(y, max(0, w - 23), f"{proj} {age} ", 22, curses.color_pair(3))
             else:
                 attr = curses.A_DIM if s.small else 0
-                stdscr.addnstr(y, 1, f"{s.emoji} {title}", w - 26, attr)
+                stdscr.addnstr(y, 1, f"{flag}{s.emoji} {title}", w - 26, attr)
                 stdscr.addnstr(y, max(0, w - 23), proj, 17, curses.color_pair(1))
                 stdscr.addnstr(y, max(0, w - 6), age, 5, curses.color_pair(2))
 
@@ -498,6 +525,15 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             selected += 1
         elif key in (curses.KEY_UP, ord("k")):
             selected -= 1
+        elif key == ord("m"):
+            if rows:
+                s = rows[selected]
+                s.comeback = toggle_comeback(s.session_id)
+                flash = f"🔖 flagged: {s.title[:50]}" if s.comeback else f"unflagged: {s.title[:50]}"
+        elif key == ord("c"):
+            focus = not focus
+            selected = 0
+            flash = "🔖 focus: might-come-back + recent" if focus else "showing recent + old"
         elif key == ord("g"):
             selected = 0
         elif key == ord("G"):
@@ -537,13 +573,18 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
 
 
 def print_list(sessions: list[Session], show_all: bool) -> None:
+    now = time.time()
     for s in sessions:
         if s.small and not show_all:
             continue
+        # default (no --all): focus on flagged + recent, matching the TUI
+        if not show_all and not (s.comeback or (now - s.mtime) < RECENT_S):
+            continue
+        flag = "🔖" if s.comeback else "  "
         mark = "✨" if s.generated else "  "
         br = f"⎇ {s.branch}"[:20] if s.branch else ""
-        print(f"{s.emoji} {mark} {rel_age(s.mtime):>4}  {s.project[:16]:<16}  "
-              f"{br:<20}  {s.title[:60]}")
+        print(f"{flag} {s.emoji} {mark} {rel_age(s.mtime):>4}  {s.project[:16]:<16}  "
+              f"{br:<20}  {s.title[:56]}")
 
 
 def main() -> None:

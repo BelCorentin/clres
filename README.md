@@ -46,14 +46,25 @@ claude plugin install clres@clres
 
 - `↑/↓` or `j/k` — move · `g/G` — top/bottom · PgUp/PgDn
 - `/` — search (title + project + summary), `Enter` keeps filter, `Esc` cancels
-- `Enter` — resume · `s` — summary popup · `t` — re-title · `a` — show hidden · `q` — quit
+- `Enter` — resume · `s` — summary popup · `t` — re-title · `q` — quit
+- `m` — flag/unflag 🔖 **"might come back"** on the highlighted session
+- `c` — toggle the focused view (🔖-flagged + recent ⇄ recent + old)
+- `a` — show hidden (tiny/headless) too
 
-### What gets hidden by default
+Each row shows the session's git branch (`⎇ branch`, `@worktree` if a linked
+worktree) and a 🔖 when it's flagged to come back to.
 
-- headless agent sessions (`entrypoint: sdk-cli` — statusline bots, SDK calls)
-- conversations whose title is shorter than `CLRES_MIN_TITLE` (bare `/model`, "hi")
+### What gets shown by default
 
-`a` (or `--all`) reveals them, dimmed.
+The picker opens on the **focused view**: sessions you flagged 🔖 to come back
+to (via `m`), plus anything touched in the last 24 h — so active work is never
+hidden. `c` widens it to older sessions; `a` (or `--all`) additionally reveals
+tiny/headless ones, dimmed. The 🔖 flag is a marker file at
+`~/.claude/comeback/<session-id>`, so it persists across runs and machines.
+
+Titles prefer the live session-state goal (`~/.claude/goals/<sid>.json`, written
+by the `session-state.sh` hook) over the raw first prompt when no `t`-generated
+title is cached — the same clean goal shown in the statusline, ntfy, and ccview.
 
 ## Generated titles & summaries
 
