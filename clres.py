@@ -78,6 +78,7 @@ class Session:
     headless: bool
     summary: str
     path: str
+    branch: str = ""      # git branch (+ ' @worktree' if linked)
 
     @property
     def small(self) -> bool:
@@ -122,6 +123,35 @@ def _user_text(entry: dict) -> str | None:
     if text.startswith("Caveat: the messages below"):
         return None
     return re.sub(r"\s+", " ", text)
+
+
+_GIT_CACHE: dict[str, str] = {}
+
+
+def _git_brief(cwd: str) -> str:
+    """Current branch for *cwd* (+ ' @<name>' in a linked worktree). Cached per cwd."""
+    if not cwd:
+        return ""
+    if cwd in _GIT_CACHE:
+        return _GIT_CACHE[cwd]
+    br = ""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            br = r.stdout.strip()
+            if br == "HEAD":
+                s = subprocess.run(["git", "-C", cwd, "rev-parse", "--short", "HEAD"],
+                                   capture_output=True, text=True, timeout=2)
+                br = s.stdout.strip() or "detached"
+            gd = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"],
+                                capture_output=True, text=True, timeout=2).stdout.strip()
+            if "/worktrees/" in gd:
+                br += " @" + os.path.basename(gd)
+    except (OSError, subprocess.SubprocessError):
+        br = ""
+    _GIT_CACHE[cwd] = br
+    return br
 
 
 def _registry_state(sid: str) -> dict:
@@ -201,6 +231,7 @@ def scan_sessions(cache: dict) -> list[Session]:
             headless=entrypoint not in ("cli", "claude-desktop"),
             summary=summary,
             path=str(jsonl),
+            branch=_git_brief(cwd),
         ))
     sessions.sort(key=lambda s: s.mtime, reverse=True)
     return sessions
@@ -423,7 +454,8 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
                 status = f" {s.summary} "
             else:
                 gen = " · ✨titled" if s.generated else ""
-                status = f" {s.session_id[:8]} · {s.cwd} · {s.n_lines} entries · {s.size // 1024}K{gen} "
+                br = f" · ⎇ {s.branch}" if s.branch else ""
+                status = f" {s.session_id[:8]} · {s.cwd}{br} · {s.n_lines} entries · {s.size // 1024}K{gen} "
         else:
             status = " no match "
         stdscr.addnstr(h - 2, 0, status[:w - 1], w - 1, curses.A_DIM)
@@ -509,7 +541,9 @@ def print_list(sessions: list[Session], show_all: bool) -> None:
         if s.small and not show_all:
             continue
         mark = "✨" if s.generated else "  "
-        print(f"{s.emoji} {mark} {rel_age(s.mtime):>4}  {s.project[:18]:<18}  {s.title[:80]}")
+        br = f"⎇ {s.branch}"[:20] if s.branch else ""
+        print(f"{s.emoji} {mark} {rel_age(s.mtime):>4}  {s.project[:16]:<16}  "
+              f"{br:<20}  {s.title[:60]}")
 
 
 def main() -> None:
