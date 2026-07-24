@@ -81,6 +81,15 @@ the list or `claude --resume`.
 Tunables (env): `CLRES_MIN_TITLE` (20 chars — hide shorter titles),
 `CLRES_MIN_ENTRIES` (15), `CLRES_MODEL` (haiku).
 
+## Projects
+
+Each conversation is tagged with a **research-project slug** (mindsentences,
+distraction, lppreadlisten, fusion, sevenT, syntax, config, obsidian,
+personal, else misc) inferred from its cwd → branch → title via the ordered
+`PROJECT_RULES` table (mirrors ccview). Classified rows show the project
+emoji + a coloured project label; `p` cycles a project filter (header shows
+the active one). Search (`/`) still matches the raw cwd basename too.
+
 ## How it works
 
 Reads `~/.claude/projects/*/*.jsonl` transcripts (honors

@@ -82,6 +82,7 @@ class Session:
     path: str
     branch: str = ""      # git branch (+ ' @worktree' if linked)
     comeback: bool = False   # flagged "might come back" (~/.claude/comeback/<sid>)
+    pslug: str = "misc"   # research-project slug (classify_project)
 
     @property
     def small(self) -> bool:
@@ -190,6 +191,58 @@ def _pick_emoji(title: str, session_id: str) -> str:
     return EMOJI_POOL[int(session_id.replace("-", "")[:8], 16) % len(EMOJI_POOL)]
 
 
+# ---------------------------------------------------------------- projects
+# Tag every conversation with a research-project slug from its cwd / branch /
+# title so the picker can icon, colour and filter by project. Ordered rules,
+# first match wins; fields per rule: b=branch, c=cwd, t=title. Mirrors ccview.
+PROJECTS = {                       # slug -> (emoji, label, color-pair index)
+    "mindsentences": ("🧠", "MindSentences",   5),
+    "distraction":   ("🎯", "Distraction",     2),
+    "lppreadlisten": ("📖", "LPP Read-Listen", 1),
+    "fusion":        ("🔗", "fMEGRI Fusion",   6),
+    "sevenT":        ("🎏", "7T",              7),
+    "syntax":        ("🌳", "Syntax",          7),
+    "config":        ("🔧", "claude-config",   1),
+    "obsidian":      ("📝", "Obsidian",        6),
+    "personal":      ("🎈", "Personal",        8),
+    "misc":          ("•",  "misc",            0),
+}
+PROJECT_ORDER = list(PROJECTS)
+
+PROJECT_RULES = [                  # (fields, regex, slug)
+    ("bct", r"bonnaire",                                   "distraction"),
+    ("bc", r"mentalizing_ext|mentalizing",                "mindsentences"),
+    ("bct", r"lppreadlisten|read.?listen|petit(read|listen)", "lppreadlisten"),
+    ("bt", r"\bdistraction\b",                             "distraction"),
+    ("ct", r"fmegri|megri|\bfusi\b|\bfusion\b",           "fusion"),
+    ("t",  r"\b7[\s-]?t(esla)?\b",                         "sevenT"),
+    ("ct", r"\.claude|ccview|clres|caveman|claude-config", "config"),
+    ("ct", r"obsidian|\bvault\b",                          "obsidian"),
+    ("ct", r"petite.?sauvag|\bfestival\b|sauvage",        "personal"),
+    ("ct", r"mindsent|mentalizing|hierarchy paper",       "mindsentences"),
+    ("t",  r"\bsyntax\b",                                  "syntax"),
+    ("c",  r"/brainai(/|$)",                               "mindsentences"),
+]
+
+_PROJ_CACHE: dict[tuple, str] = {}
+
+
+def classify_project(cwd: str = "", branch: str = "", title: str = "") -> str:
+    key = (cwd, branch, title)
+    hit = _PROJ_CACHE.get(key)
+    if hit is not None:
+        return hit
+    hay = {"b": (branch or "").lower(), "c": (cwd or "").lower(),
+           "t": (title or "").lower()}
+    slug = "misc"
+    for fields, pat, cand in PROJECT_RULES:
+        if any(re.search(pat, hay[f]) for f in fields):
+            slug = cand
+            break
+    _PROJ_CACHE[key] = slug
+    return slug
+
+
 def scan_sessions(cache: dict) -> list[Session]:
     sessions = []
     for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
@@ -251,6 +304,7 @@ def scan_sessions(cache: dict) -> list[Session]:
             path=str(jsonl),
             branch=_git_brief(cwd),
             comeback=is_comeback(sid),
+            pslug=classify_project(cwd, _git_brief(cwd), title),
         ))
     sessions.sort(key=lambda s: s.mtime, reverse=True)
     return sessions
@@ -416,10 +470,15 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
     curses.init_pair(2, curses.COLOR_YELLOW, -1)  # age
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selection
     curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # header/filter
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # project colours (5-8)
+    curses.init_pair(6, curses.COLOR_BLUE, -1)
+    curses.init_pair(7, curses.COLOR_GREEN, -1)
+    curses.init_pair(8, curses.COLOR_RED, -1)
 
     selected, offset, query = 0, 0, ""
     search_mode = False
     focus = True                 # default view: flagged "might come back" + recent
+    project_filter = None        # active project slug filter (cycled with p)
     flash = ""
 
     def filtered():
@@ -431,6 +490,8 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             foc = [s for s in rows if s.comeback or (now - s.mtime) < RECENT_S]
             if foc:
                 rows = foc
+        if project_filter:
+            rows = [s for s in rows if s.pslug == project_filter]
         if query:
             q = query.lower()
             rows = [s for s in rows if q in s.title.lower() or q in s.project.lower()
@@ -450,9 +511,10 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
 
         stdscr.erase()
         scope = " (all)" if show_all else (" 🔖focus" if focus else " (recent+old)")
-        header = f" clres · {len(rows)}/{len(sessions)}{scope} "
+        pf = f" · {PROJECTS[project_filter][0]} {PROJECTS[project_filter][1]}" if project_filter else ""
+        header = f" clres · {len(rows)}/{len(sessions)}{scope}{pf} "
         hint = (" type to search · Enter done · Esc cancel " if search_mode else
-                " ↑↓ · ⏎ resume · m 🔖 · c focus · / search · s summary · t title · a all · q ")
+                " ↑↓ · ⏎ resume · p proj · m 🔖 · c focus · / search · s sum · a all · q ")
         stdscr.addnstr(0, 0, header, w - 1, curses.color_pair(4) | curses.A_BOLD)
         stdscr.addnstr(0, max(0, w - len(hint) - 1), hint, w - 1, curses.A_DIM)
 
@@ -460,17 +522,19 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             y = i + 1
             is_sel = (offset + i) == selected
             age = rel_age(s.mtime).rjust(4)
-            proj = s.project[:16].ljust(16)
+            pemoji, plabel, pcolor = PROJECTS[s.pslug]
+            icon = pemoji if s.pslug != "misc" else s.emoji
+            proj = (plabel if s.pslug != "misc" else s.project)[:16].ljust(16)
             flag = "🔖" if s.comeback else "  "
             title = s.title
             if is_sel:
                 stdscr.addnstr(y, 0, " " * (w - 1), w - 1, curses.color_pair(3))
-                stdscr.addnstr(y, 1, f"{flag}{s.emoji} {title}", w - 26, curses.color_pair(3) | curses.A_BOLD)
+                stdscr.addnstr(y, 1, f"{flag}{icon} {title}", w - 26, curses.color_pair(3) | curses.A_BOLD)
                 stdscr.addnstr(y, max(0, w - 23), f"{proj} {age} ", 22, curses.color_pair(3))
             else:
                 attr = curses.A_DIM if s.small else 0
-                stdscr.addnstr(y, 1, f"{flag}{s.emoji} {title}", w - 26, attr)
-                stdscr.addnstr(y, max(0, w - 23), proj, 17, curses.color_pair(1))
+                stdscr.addnstr(y, 1, f"{flag}{icon} {title}", w - 26, attr)
+                stdscr.addnstr(y, max(0, w - 23), proj, 17, curses.color_pair(pcolor))
                 stdscr.addnstr(y, max(0, w - 6), age, 5, curses.color_pair(2))
 
         if flash:
@@ -534,6 +598,19 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool):
             focus = not focus
             selected = 0
             flash = "🔖 focus: might-come-back + recent" if focus else "showing recent + old"
+        elif key == ord("p"):
+            present = [p for p in PROJECT_ORDER
+                       if any(s.pslug == p for s in (sessions if show_all
+                                                     else [x for x in sessions if not x.small]))]
+            cyc = [None] + present
+            try:
+                i = cyc.index(project_filter)
+            except ValueError:
+                i = 0
+            project_filter = cyc[(i + 1) % len(cyc)]
+            selected = 0
+            flash = (f"project: {PROJECTS[project_filter][1]}" if project_filter
+                     else "project: all")
         elif key == ord("g"):
             selected = 0
         elif key == ord("G"):
@@ -582,9 +659,11 @@ def print_list(sessions: list[Session], show_all: bool) -> None:
             continue
         flag = "🔖" if s.comeback else "  "
         mark = "✨" if s.generated else "  "
-        br = f"⎇ {s.branch}"[:20] if s.branch else ""
-        print(f"{flag} {s.emoji} {mark} {rel_age(s.mtime):>4}  {s.project[:16]:<16}  "
-              f"{br:<20}  {s.title[:56]}")
+        pemoji, plabel, _ = PROJECTS[s.pslug]
+        icon = pemoji if s.pslug != "misc" else s.emoji
+        proj = plabel if s.pslug != "misc" else s.project
+        print(f"{flag} {icon} {mark} {rel_age(s.mtime):>4}  {proj[:16]:<16}  "
+              f"{s.title[:60]}")
 
 
 def main() -> None:
