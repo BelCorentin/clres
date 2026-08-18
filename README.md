@@ -2,9 +2,10 @@
 
 Browse and resume your Claude Code conversations from a tiny terminal picker.
 
-Each conversation gets an emoji (keyword-based, stable), its first prompt as
-title, the project it belongs to, and its age. Hit Enter to resume it with
-`claude --resume` from its original working directory.
+Each conversation gets an emoji (keyword-based, stable), a title (haiku-
+generated from the whole conversation once indexed, else a live tail-goal or
+the raw first prompt), the project it belongs to, and its age. Hit Enter to
+resume it with `claude --resume` from its original working directory.
 
 ```
  clres · 19/1178 🔖focus · last 1d    ↑↓ · ⏎ resume · [ ] days · p proj · m 🔖 · c focus · / search · a all · ? · q
@@ -37,8 +38,9 @@ claude plugin install clres@clres
 | `clres`              | interactive curses picker (last 1 day)                            |
 | `clres -d N`         | `--days N` — look back N days; `0` = no time limit                |
 | `clres --all`        | include tiny + headless + 🤖 subagent transcripts, no time limit   |
-| `clres --index`      | haiku-title every untitled real conversation                      |
-| `clres --summarize`  | haiku-summarize every real conversation                           |
+| `clres --index`      | haiku-title every untitled/`~live`-only real conversation         |
+| `clres --reindex`    | also re-title/re-summarize convos that already have a ✨ title     |
+| `clres --summarize`  | haiku-summarize every untitled/`~live`-only real conversation      |
 | `clres --list`       | plain table (also used when piped)                                |
 | `clres --json`       | machine-readable dump                                             |
 | `clres --help`       | flag reference                                                    |
@@ -97,21 +99,28 @@ marked with a 🤖 icon and an `agent:` title prefix. Resuming one opens its
 **parent** session, since an agent transcript is not independently resumable.
 They are also excluded from `--index` / `--summarize`.
 
-Titles prefer the live session-state goal (`~/.claude/goals/<sid>.json`, written
-by the `session-state.sh` hook) over the raw first prompt when no `t`-generated
-title is cached — the same clean goal shown in the statusline, ntfy, and ccview.
+Titles fall back to the live session-state goal (`~/.claude/goals/<sid>.json`,
+written by the `session-state.sh` hook, marked `~` in the list) over the raw
+first prompt when no ✨ title is cached yet. That goal is summarized from only
+the transcript **tail** — it's meant for "what's happening right now" in the
+statusline/ntfy push — so it tracks the last few turns, not necessarily the
+conversation's actual topic. `~` titles stay eligible for `--index`/`t` so they
+get upgraded to a real ✨ title once generated.
 
 ## Generated titles & summaries
 
-`--index` (or `t` on a row) sends the first user prompt + last assistant
-message of a conversation to `claude --model haiku -p` and caches the
-returned title in `~/.cache/clres/titles.json` (marked ✨ in the list).
-`--summarize` (or `s` on a row) does the same for a 2-3 sentence summary,
-shown in the status bar / a popup and included in search. Only real
+`--index` (or `t` on a row) samples user messages evenly across the **whole**
+transcript (not just the first/last) plus the last assistant message, sends
+that to `claude --model haiku -p` asking for the *main recurring topic*, and
+caches the returned title in `~/.cache/clres/titles.json` (marked ✨ in the
+list). `--summarize` (or `s` on a row) does the same for a 2-3 sentence
+summary, shown in the status bar / a popup and included in search. Only real
 conversations with ≥ `CLRES_MIN_ENTRIES` (15) transcript entries are
-auto-indexed. The titler's own headless sessions are corralled into a
-throwaway `/tmp/clres-titler` project and deleted, so they never pollute
-the list or `claude --resume`.
+auto-indexed; `--reindex` also re-runs it on conversations that already have a
+✨ title/summary (use after a title-generation change like this one). The
+titler's own headless sessions are corralled into a throwaway
+`/tmp/clres-titler` project and deleted, so they never pollute the list or
+`claude --resume`.
 
 Tunables (env): `CLRES_MIN_TITLE` (20 chars — hide shorter titles),
 `CLRES_MIN_ENTRIES` (15), `CLRES_MODEL` (haiku).

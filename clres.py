@@ -13,8 +13,9 @@ Usage:
   clres              interactive picker
   clres -d 7         look back 7 days (--days; 0 = no time limit)
   clres --all        include tiny + headless + agent transcripts, no time limit
-  clres --index      generate haiku titles for all untitled real convos
-  clres --summarize  generate haiku summaries for all real convos
+  clres --index      generate haiku titles for all untitled/live-only real convos
+  clres --reindex    like --index but also redo convos that already have a ✨ title
+  clres --summarize  generate haiku summaries for all untitled/live-only real convos
   clres --list       plain table (no TTY needed)
   clres --json       machine-readable dump
 """
@@ -83,6 +84,8 @@ class Session:
     headless: bool
     summary: str
     path: str
+    title_source: str = "raw"     # "raw" | "live" (session-state goal) | "digest"
+    summary_source: str = "none"  # "none" | "live" (session-state detail) | "digest"
     branch: str = ""      # git branch (+ ' @worktree' if linked)
     comeback: bool = False   # flagged "might come back" (~/.claude/comeback/<sid>)
     pslug: str = "misc"   # research-project slug (classify_project)
@@ -322,21 +325,29 @@ def scan_sessions(cache: dict) -> list[Session]:
             # parent session (the dir name is the sid when the entry lacks it).
             parent_sid = parent_sid or jsonl.parent.parent.name
         generated = False
+        title_source = "raw"
+        summary_source = "none"
         emoji = None
         summary = cache.get(sid, {}).get("summary", "")
+        if summary:
+            summary_source = "digest"
         cached = cache.get(sid, {}).get("title")
         if cached:
-            title, generated = cached, True
+            title, generated, title_source = cached, True, "digest"
         else:
-            # Prefer the live session-state registry goal over the raw first
-            # prompt — it's summarized at turn end and shared with the
-            # statusline/ntfy/ccview, so no extra Haiku call here.
+            # Live session-state registry goal/detail, shown as a stand-in
+            # until a real whole-conversation title/summary exists. Both are
+            # summarized from only the transcript TAIL (current objective, for
+            # the statusline/ntfy push) so they track the last few turns, not
+            # the conversation's actual topic — title_source/summary_source
+            # "live" keeps them eligible for --index/--summarize/--reindex to
+            # upgrade to a "digest" version.
             reg = _registry_state(sid)
             if reg.get("goal"):
-                title, generated = reg["goal"], True
+                title, generated, title_source = reg["goal"], True, "live"
                 emoji = reg.get("emoji") or None
                 if not summary and reg.get("detail"):
-                    summary = reg["detail"]
+                    summary, summary_source = reg["detail"], "live"
         if is_agent:
             # After the cache/registry override, so a haiku-titled 🤖 row
             # keeps its prefix instead of losing it.
@@ -355,6 +366,8 @@ def scan_sessions(cache: dict) -> list[Session]:
             headless=entrypoint not in ("cli", "claude-desktop"),
             summary=summary,
             path=str(jsonl),
+            title_source=title_source,
+            summary_source=summary_source,
             branch=_git_brief(cwd),
             comeback=is_comeback(sid),
             pslug=classify_project(cwd, _git_brief(cwd), title),
@@ -367,30 +380,49 @@ def scan_sessions(cache: dict) -> list[Session]:
 
 # ------------------------------------------------------- title generation
 
-def _endpoints(path: str) -> tuple[str, str]:
-    """First user prompt + last assistant text of a transcript."""
-    first, last_raw = "", None
+def _last_assistant_text(path: str) -> str:
+    last_raw = None
     with open(path, errors="replace") as fh:
         for line in fh:
-            if not first and '"type":"user"' in line[:400]:
-                try:
-                    t = _user_text(json.loads(line))
-                    if t:
-                        first = t
-                except json.JSONDecodeError:
-                    pass
             if '"type":"assistant"' in line and '"isSidechain":true' not in line:
                 last_raw = line
-    last = ""
-    if last_raw:
-        try:
-            content = json.loads(last_raw).get("message", {}).get("content", [])
-            if isinstance(content, list):
-                last = " ".join(c.get("text", "") for c in content
-                                if isinstance(c, dict) and c.get("type") == "text")
-        except json.JSONDecodeError:
-            pass
-    return first[:1500], re.sub(r"\s+", " ", last).strip()[:1500]
+    if not last_raw:
+        return ""
+    try:
+        content = json.loads(last_raw).get("message", {}).get("content", [])
+        if isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content
+                             if isinstance(c, dict) and c.get("type") == "text")
+            return re.sub(r"\s+", " ", text).strip()[:1500]
+    except json.JSONDecodeError:
+        pass
+    return ""
+
+
+def _conversation_digest(path: str, max_samples: int = 10, char_budget: int = 350) -> tuple[str, str]:
+    """User prompts evenly sampled across the WHOLE transcript, plus the last
+    assistant message. First+last alone skews generated titles toward how a
+    conversation happened to end rather than its actual main topic."""
+    texts = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"type":"user"' in line[:400]:
+                try:
+                    t = _user_text(json.loads(line))
+                except json.JSONDecodeError:
+                    t = None
+                if t:
+                    texts.append(t)
+    last = _last_assistant_text(path)
+    if not texts:
+        return "", last
+    n = len(texts)
+    if n <= max_samples:
+        idxs = range(n)
+    else:
+        idxs = sorted({round(i * (n - 1) / (max_samples - 1)) for i in range(max_samples)})
+    excerpt = "\n---\n".join(texts[i][:char_budget] for i in idxs)
+    return excerpt[:4000], last
 
 
 def _ask_haiku(prompt: str) -> str | None:
@@ -408,26 +440,30 @@ def _ask_haiku(prompt: str) -> str | None:
 
 
 def generate_title(session: Session) -> str | None:
-    first, last = _endpoints(session.path)
-    if not first and not last:
+    excerpt, last = _conversation_digest(session.path)
+    if not excerpt and not last:
         return None
     out = _ask_haiku(
         "Write a short descriptive title (max 8 words, no quotes, no trailing "
-        "period) for this coding-assistant conversation, based on its first "
-        "user message and last assistant message. Output the title only.\n\n"
-        f"FIRST USER MESSAGE:\n{first}\n\nLAST ASSISTANT MESSAGE:\n{last}"
+        "period) for this coding-assistant conversation. Base it on the MAIN "
+        "recurring topic/goal across the sampled user messages below, not just "
+        "how it happened to end. Output the title only.\n\n"
+        f"USER MESSAGES (sampled across the whole conversation):\n{excerpt}\n\n"
+        f"LAST ASSISTANT MESSAGE:\n{last}"
     )
     return out.splitlines()[0].strip(' "\'')[:100] if out else None
 
 
 def generate_summary(session: Session) -> str | None:
-    first, last = _endpoints(session.path)
-    if not first and not last:
+    excerpt, last = _conversation_digest(session.path)
+    if not excerpt and not last:
         return None
     out = _ask_haiku(
         "Summarize this coding-assistant conversation in 2-3 plain sentences: "
-        "what the user wanted and where it ended up. No preamble.\n\n"
-        f"FIRST USER MESSAGE:\n{first}\n\nLAST ASSISTANT MESSAGE:\n{last}"
+        "what the user wanted overall and where it ended up. Weigh the whole "
+        "arc of user messages below, not just the ending. No preamble.\n\n"
+        f"USER MESSAGES (sampled across the whole conversation):\n{excerpt}\n\n"
+        f"LAST ASSISTANT MESSAGE:\n{last}"
     )
     return re.sub(r"\s+", " ", out).strip()[:600] if out else None
 
@@ -441,18 +477,23 @@ def _cache_set(cache: dict, sid: str, **fields) -> None:
 def apply_title(session: Session, title: str, cache: dict) -> None:
     session.title = title
     session.generated = True
+    session.title_source = "digest"
     session.emoji = _pick_emoji(title, session.session_id)
     _cache_set(cache, session.session_id, title=title)
 
 
 def apply_summary(session: Session, summary: str, cache: dict) -> None:
     session.summary = summary
+    session.summary_source = "digest"
     _cache_set(cache, session.session_id, summary=summary)
 
 
-def index_titles(sessions: list[Session], cache: dict) -> None:
+def index_titles(sessions: list[Session], cache: dict, force: bool = False) -> None:
+    # title_source != "digest" also catches "live" (session-state's recency-
+    # biased tail-summary goal) so those get upgraded to a real whole-
+    # conversation title, not just untitled ("raw") sessions.
     todo = [s for s in sessions
-            if not s.generated and not s.headless and not s.agent
+            if (force or s.title_source != "digest") and not s.headless and not s.agent
             and s.n_lines >= MIN_ENTRIES]
     if not todo:
         print("All conversations already titled.")
@@ -467,9 +508,9 @@ def index_titles(sessions: list[Session], cache: dict) -> None:
             print(f"  [{i}/{len(todo)}] failed: {s.session_id[:8]}")
 
 
-def index_summaries(sessions: list[Session], cache: dict) -> None:
+def index_summaries(sessions: list[Session], cache: dict, force: bool = False) -> None:
     todo = [s for s in sessions
-            if not s.summary and not s.headless and not s.agent
+            if (force or s.summary_source != "digest") and not s.headless and not s.agent
             and s.n_lines >= MIN_ENTRIES]
     if not todo:
         print("All conversations already summarized.")
@@ -750,7 +791,7 @@ def run_tui(stdscr, sessions: list[Session], cache: dict, show_all: bool,
             if s.summary:
                 status = f" {s.summary} "
             else:
-                gen = " · ✨titled" if s.generated else ""
+                gen = {"digest": " · ✨titled", "live": " · ~live"}.get(s.title_source, "")
                 br = f" · ⎇ {s.branch}" if s.branch else ""
                 status = f" {s.session_id[:8]} · {s.cwd}{br} · {s.n_lines} entries · {s.size // 1024}K{gen} "
         else:
@@ -897,7 +938,7 @@ def print_list(sessions: list[Session], show_all: bool, days: int) -> None:
         return
     for s in rows:
         flag = "🔖" if s.comeback else "  "
-        mark = "✨" if s.generated else "  "
+        mark = {"digest": "✨", "live": "~"}.get(s.title_source, " ")
         pemoji, plabel, _ = PROJECTS[s.pslug]
         icon = "🤖" if s.agent else (pemoji if s.pslug != "misc" else s.emoji)
         proj = plabel if s.pslug != "misc" else s.project
@@ -921,9 +962,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="include tiny + headless + 🤖 subagent transcripts, "
                         "and drop the default time limit")
     p.add_argument("--index", action="store_true",
-                   help=f"generate {TITLE_MODEL} titles for all untitled real convos")
+                   help=f"generate {TITLE_MODEL} titles for all untitled/live-only real convos")
+    p.add_argument("--reindex", action="store_true",
+                   help=f"like --index but also re-titles/re-summarizes convos that "
+                        f"already have a digest title (use after a title-generation fix)")
     p.add_argument("--summarize", action="store_true",
-                   help=f"generate {TITLE_MODEL} summaries for all real convos")
+                   help=f"generate {TITLE_MODEL} summaries for all untitled/live-only real convos")
     p.add_argument("--list", action="store_true",
                    help="plain table instead of the picker (implied when piped)")
     p.add_argument("--json", action="store_true",
@@ -944,11 +988,11 @@ def main() -> None:
     show_all = args.all
     # An explicit --days always wins; otherwise --all drops the default limit.
     days = args.days if args.days is not None else (0 if show_all else DEFAULT_DAYS)
-    if args.index:
-        index_titles(sessions, cache)
+    if args.index or args.reindex:
+        index_titles(sessions, cache, force=args.reindex)
         return
     if args.summarize:
-        index_summaries(sessions, cache)
+        index_summaries(sessions, cache, force=args.reindex)
         return
     if args.json:
         # unfiltered by default (back-compat); --days/--all narrow it
