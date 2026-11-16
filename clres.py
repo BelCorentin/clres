@@ -216,7 +216,7 @@ def _pick_emoji(title: str, session_id: str) -> str:
 # title so the picker can icon, colour and filter by project. Ordered rules,
 # first match wins; fields per rule: b=branch, c=cwd, t=title+name.
 #
-# !! KEEP IN SYNC WITH ccview.py (~/git/ccview/ccview.py) !!
+# !! KEEP IN SYNC WITH ccview.py (~/git/tools/ccview/ccview.py) !!
 # PROJECTS / PROJECT_RULES / classify_project are DUPLICATED on purpose, not
 # shared via an import or a config file: ccview pipes its own source over ssh
 # to run on remotes, so it must stay a single self-contained file. Change one

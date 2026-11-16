@@ -18,8 +18,8 @@ resume it with `claude --resume` from its original working directory.
 ## Install (shell alias)
 
 ```bash
-git clone https://github.com/BelCorentin/clres ~/git/clres
-~/git/clres/install.sh   # adds `alias clres=...` to ~/.zshrc
+git clone https://github.com/BelCorentin/clres ~/git/tools/clres
+~/git/tools/clres/install.sh   # adds `alias clres=...` to ~/.zshrc
 ```
 
 ## Install (Claude Code plugin)
@@ -27,7 +27,7 @@ git clone https://github.com/BelCorentin/clres ~/git/clres
 Adds a `/clres` slash command that lists conversations inside a session:
 
 ```bash
-claude plugin marketplace add ~/git/clres
+claude plugin marketplace add ~/git/tools/clres
 claude plugin install clres@clres
 ```
 
